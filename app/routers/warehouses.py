@@ -54,7 +54,6 @@ async def create_warehouse(
     return warehouse
 
 
-# /valuation должен быть ДО /{warehouse_id}, иначе FastAPI поймает "valuation" как id
 @router.get("/valuation", response_model=list[WarehouseValuation])
 async def get_financial_valuation(
     db: AsyncSession = Depends(get_db),
@@ -64,9 +63,6 @@ async def get_financial_valuation(
     if cached:
         return [WarehouseValuation(**item) for item in json.loads(cached)]
 
-    # Один запрос: для каждого склада считаем стоимость остатков.
-    # CASE: движение "в склад" → +qty*price, "со склада" → -qty*price.
-    # literal(0).cast(NUMERIC) гарантирует, что COALESCE вернёт "0.00", а не "0".
     stmt = (
         select(
             Warehouse.id.label("warehouse_id"),
@@ -100,7 +96,6 @@ async def get_financial_valuation(
         for row in result.all()
     ]
 
-    # Decimal несериализуем в JSON — конвертируем в строку; Pydantic восстановит обратно
     await redis_client.set(
         VALUATION_CACHE_KEY,
         json.dumps([

@@ -56,7 +56,6 @@ class StockMovement(Base):
     type: Mapped[MovementType] = mapped_column(Enum(MovementType), nullable=False)
     product_id: Mapped[int] = mapped_column(ForeignKey("products.id"), nullable=False)
     quantity: Mapped[int] = mapped_column(Integer, nullable=False)
-    # IN не имеет отправителя, OUT не имеет получателя
     from_warehouse_id: Mapped[int | None] = mapped_column(ForeignKey("warehouses.id"), nullable=True)
     to_warehouse_id: Mapped[int | None] = mapped_column(ForeignKey("warehouses.id"), nullable=True)
     performed_by: Mapped[int] = mapped_column(ForeignKey("users.id"), nullable=False)

@@ -10,7 +10,7 @@ def notify_low_stock(
     current_balance: int,
     min_stock_level: int,
 ) -> None:
-    """Фоновая задача: логирует факт отправки email при низком остатке."""
+    """Background task: logs email notification for low stock."""
     logger.warning(
         "[EMAIL] Low stock alert: product %s (%s) at warehouse %d — "
         "balance %d is below min_stock_level %d",

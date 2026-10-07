@@ -15,7 +15,6 @@ router = APIRouter(prefix="/movements", tags=["movements"])
 
 
 async def get_balance(db: AsyncSession, product_id: int, warehouse_id: int) -> int:
-    """Остаток товара на складе = приход - расход по истории движений."""
     stmt = select(
         func.coalesce(
             func.sum(
@@ -81,8 +80,8 @@ async def create_movement(
 
     product = None
     if data.type in (MovementType.OUT, MovementType.TRANSFER):
-        # SELECT FOR UPDATE блокирует строку товара до конца транзакции,
-        # не давая другим запросам одновременно списать тот же остаток
+        # SELECT FOR UPDATE holds a row-level lock until end of transaction,
+        # preventing concurrent requests from reading a stale balance
         result = await db.execute(
             select(Product)
             .where(Product.id == data.product_id, Product.is_deleted == False)
@@ -111,7 +110,6 @@ async def create_movement(
     await db.commit()
     await invalidate_valuation_cache()
 
-    # Проверяем остаток после commit — если упал ниже порога, шлём уведомление фоном
     if product is not None and data.from_warehouse_id is not None:
         new_balance = await get_balance(db, product.id, data.from_warehouse_id)
         if new_balance < product.min_stock_level:
@@ -149,7 +147,6 @@ async def create_batch_movement(
     if data.to_warehouse_id is not None:
         await check_active_warehouse(db, data.to_warehouse_id)
 
-    # Суммируем количества по SKU (один SKU может встречаться несколько раз)
     quantity_by_sku: dict[str, int] = defaultdict(int)
     for item in data.items:
         quantity_by_sku[item.sku] += item.quantity
@@ -157,8 +154,8 @@ async def create_batch_movement(
     skus = list(quantity_by_sku.keys())
 
     if data.type in (MovementType.OUT, MovementType.TRANSFER):
-        # Сортируем по id — все транзакции будут блокировать в одном порядке,
-        # что исключает deadlock при параллельных batch-запросах
+        # Sort by id so all concurrent transactions acquire locks in the same order,
+        # preventing deadlocks on parallel batch requests
         result = await db.execute(
             select(Product)
             .where(Product.sku.in_(skus), Product.is_deleted == False)
@@ -172,7 +169,6 @@ async def create_batch_movement(
 
     products_by_sku = {p.sku: p for p in result.scalars().all()}
 
-    # Возвращаем все неизвестные SKU одной ошибкой
     unknown = [sku for sku in skus if sku not in products_by_sku]
     if unknown:
         raise HTTPException(
@@ -183,7 +179,6 @@ async def create_batch_movement(
     if data.type in (MovementType.OUT, MovementType.TRANSFER):
         product_ids = [p.id for p in products_by_sku.values()]
 
-        # Один запрос: остатки всех товаров на складе-источнике
         balance_result = await db.execute(
             select(
                 StockMovement.product_id,
@@ -215,14 +210,12 @@ async def create_batch_movement(
             if available < total_qty:
                 insufficient.append({"sku": sku, "requested": total_qty, "available": available})
 
-        # Если не хватает хотя бы одной позиции — откатываем всё
         if insufficient:
             raise HTTPException(
                 status_code=status.HTTP_409_CONFLICT,
                 detail={"message": "Insufficient stock", "items": insufficient},
             )
 
-    # Все проверки прошли — создаём движения в одной транзакции
     movements = [
         StockMovement(
             type=data.type,
@@ -238,7 +231,6 @@ async def create_batch_movement(
     await db.commit()
     await invalidate_valuation_cache()
 
-    # Проверяем остатки после commit для всех списанных товаров
     if data.type in (MovementType.OUT, MovementType.TRANSFER) and data.from_warehouse_id is not None:
         product_ids = [p.id for p in products_by_sku.values()]
         new_balance_result = await db.execute(

@@ -28,8 +28,6 @@ async def list_products(
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
-    # Подзапрос: суммарный остаток по всем складам для каждого товара.
-    # IN прибавляет к остатку, OUT вычитает, TRANSFER — внутренняя перекладка (итог 0).
     balance_subq = (
         select(
             StockMovement.product_id,
@@ -71,7 +69,6 @@ async def list_products(
     else:
         primary = Product.id
 
-    # Вторичная сортировка по id — стабильный порядок при равных значениях
     sort_dir = primary.asc() if order == "asc" else primary.desc()
     stmt = stmt.order_by(sort_dir, Product.id.asc())
     stmt = stmt.limit(limit).offset(offset)
@@ -160,7 +157,6 @@ async def update_product(
             status_code=status.HTTP_409_CONFLICT,
             detail="Product with this SKU already exists",
         )
-    # base_price могла измениться — финансовая оценка складов стала неактуальной
     await invalidate_valuation_cache()
     await db.refresh(product)
     return product
@@ -179,6 +175,5 @@ async def delete_product(
     if not product:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
 
-    # Soft-delete: не удаляем из БД, чтобы не потерять историю движений
     product.is_deleted = True
     await db.commit()
