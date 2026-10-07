@@ -123,6 +123,41 @@ async def test_batch_atomicity_rollback_on_insufficient_stock(client: AsyncClien
     assert balance_a == 5
 
 
+async def test_idempotency_key_prevents_duplicate_movement(client: AsyncClient, admin_headers: dict):
+    """
+    Two sequential OUT requests with the same Idempotency-Key create exactly one
+    movement. The second response is identical to the first.
+    """
+    wh_id = await _create_warehouse(client, admin_headers, "WH-IDEM")
+    product = await _create_product(client, admin_headers, "SKU-IDEM")
+    product_id = product["id"]
+
+    r = await _in(client, admin_headers, product_id, wh_id, 10)
+    assert r.status_code == 201
+
+    idem_headers = {**admin_headers, "Idempotency-Key": "test-key-001"}
+
+    r1 = await client.post("/movements", json={
+        "type": "OUT",
+        "product_id": product_id,
+        "quantity": 3,
+        "from_warehouse_id": wh_id,
+    }, headers=idem_headers)
+    assert r1.status_code == 201
+
+    r2 = await client.post("/movements", json={
+        "type": "OUT",
+        "product_id": product_id,
+        "quantity": 3,
+        "from_warehouse_id": wh_id,
+    }, headers=idem_headers)
+    assert r2.status_code == 201
+    assert r1.json()["id"] == r2.json()["id"]
+
+    balance = await _get_total_balance(client, admin_headers, "SKU-IDEM")
+    assert balance == 7
+
+
 async def test_balance_calculation_after_in_transfer_out(client: AsyncClient, admin_headers: dict):
     """
     IN(10) -> TRANSFER(4) -> OUT(3): total balance across all warehouses must be 7.

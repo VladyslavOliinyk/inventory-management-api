@@ -110,6 +110,9 @@ All items are validated in a single transaction. Balances for all products are f
 ### Cache
 `GET /warehouses/valuation` result is cached in Redis under key `financial_valuation` with TTL 300s. The cache is invalidated (deleted) after every `commit` in movements, and after any product price or warehouse name change. If Redis is unavailable, the error is logged and the request proceeds normally.
 
+### Idempotency-Key
+`POST /movements` and `POST /movements/batch` accept an optional `Idempotency-Key` header. On the first request the key is atomically reserved in Redis with `SET NX` (status `processing`). After a successful commit the response (status code + body) is stored under `idempotency:{user_id}:{path}:{key}` for 24 hours. A repeat request with the same key returns the stored response without touching the database. If the first request is still in flight, the repeat gets 409. If the request fails (insufficient stock, 400, 404), the key is deleted so the client can retry after fixing the issue. If Redis is unavailable the request proceeds normally.
+
 ### Indexes and constraints
 `stock_movements` has B-tree indexes on `product_id`, `from_warehouse_id`, and `to_warehouse_id` — the columns used in every balance aggregation query. A `CHECK (quantity > 0)` constraint enforces the business rule at the database level.
 
@@ -131,11 +134,11 @@ After each OUT or TRANSFER `commit`, the new balance is compared to `min_stock_l
 |------|-----------------|
 | `test_race_condition_stock_never_goes_negative` | 15 concurrent OUT requests against stock of 10 — exactly 10 succeed, 5 get 409, final balance is 0 |
 | `test_batch_atomicity_rollback_on_insufficient_stock` | Batch with one short item returns 409 and leaves all balances unchanged |
+| `test_idempotency_key_prevents_duplicate_movement` | Two sequential OUT requests with the same `Idempotency-Key` create exactly one movement; second response matches the first |
 | `test_balance_calculation_after_in_transfer_out` | IN(10) → TRANSFER(4) → OUT(3) yields total balance of 7; TRANSFER does not change the total |
 
 ## Not implemented / next steps
 
-- **Idempotency-Key** — deduplicate movements via Redis-cached response keyed by `Idempotency-Key` header (24h TTL).
 - **Sliding window rate limiting** — max 50 movements per minute per user via Redis sorted sets.
 - Real email delivery (currently logs a warning).
 

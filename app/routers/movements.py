@@ -1,14 +1,22 @@
 from collections import defaultdict
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, status
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
+
+from fastapi.responses import JSONResponse
 
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.models import MovementType, Product, StockMovement, User, Warehouse
 from app.notifications import notify_low_stock
-from app.redis_client import invalidate_valuation_cache
+from app.redis_client import (
+    idempotency_delete,
+    idempotency_get,
+    idempotency_set_processing,
+    idempotency_set_result,
+    invalidate_valuation_cache,
+)
 from app.schemas import BatchMovementCreate, MovementCreate, MovementOut
 
 router = APIRouter(prefix="/movements", tags=["movements"])
@@ -65,65 +73,85 @@ async def create_movement(
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
-    if data.to_warehouse_id is not None:
-        await check_active_warehouse(db, data.to_warehouse_id)
-    if data.from_warehouse_id is not None:
-        await check_active_warehouse(db, data.from_warehouse_id)
+    if idempotency_key:
+        cached = await idempotency_get(user.id, "/movements", idempotency_key)
+        if cached is not None:
+            if cached["status_code"] == 0:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Request is already being processed")
+            return JSONResponse(status_code=cached["status_code"], content=cached["body"])
+        acquired = await idempotency_set_processing(user.id, "/movements", idempotency_key)
+        if not acquired:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Request is already being processed")
 
-    if data.type == MovementType.IN:
-        result = await db.execute(
-            select(Product).where(Product.id == data.product_id, Product.is_deleted == False)
-        )
-        if not result.scalar_one_or_none():
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
+    try:
+        if data.to_warehouse_id is not None:
+            await check_active_warehouse(db, data.to_warehouse_id)
+        if data.from_warehouse_id is not None:
+            await check_active_warehouse(db, data.from_warehouse_id)
 
-    product = None
-    if data.type in (MovementType.OUT, MovementType.TRANSFER):
-        # SELECT FOR UPDATE holds a row-level lock until end of transaction,
-        # preventing concurrent requests from reading a stale balance
-        result = await db.execute(
-            select(Product)
-            .where(Product.id == data.product_id, Product.is_deleted == False)
-            .with_for_update()
-        )
-        product = result.scalar_one_or_none()
-        if not product:
-            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
-
-        balance = await get_balance(db, data.product_id, data.from_warehouse_id)
-        if balance < data.quantity:
-            raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail=f"Insufficient stock: available {balance}, needed {data.quantity}",
+        if data.type == MovementType.IN:
+            result = await db.execute(
+                select(Product).where(Product.id == data.product_id, Product.is_deleted == False)
             )
+            if not result.scalar_one_or_none():
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
 
-    movement = StockMovement(
-        type=data.type,
-        product_id=data.product_id,
-        quantity=data.quantity,
-        from_warehouse_id=data.from_warehouse_id,
-        to_warehouse_id=data.to_warehouse_id,
-        performed_by=user.id,
-    )
-    db.add(movement)
-    await db.commit()
-    await invalidate_valuation_cache()
-
-    if product is not None and data.from_warehouse_id is not None:
-        new_balance = await get_balance(db, product.id, data.from_warehouse_id)
-        if new_balance < product.min_stock_level:
-            background_tasks.add_task(
-                notify_low_stock,
-                product.sku,
-                product.name,
-                data.from_warehouse_id,
-                new_balance,
-                product.min_stock_level,
+        product = None
+        if data.type in (MovementType.OUT, MovementType.TRANSFER):
+            # SELECT FOR UPDATE holds a row-level lock until end of transaction,
+            # preventing concurrent requests from reading a stale balance
+            result = await db.execute(
+                select(Product)
+                .where(Product.id == data.product_id, Product.is_deleted == False)
+                .with_for_update()
             )
+            product = result.scalar_one_or_none()
+            if not product:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
 
-    await db.refresh(movement)
-    return movement
+            balance = await get_balance(db, data.product_id, data.from_warehouse_id)
+            if balance < data.quantity:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail=f"Insufficient stock: available {balance}, needed {data.quantity}",
+                )
+
+        movement = StockMovement(
+            type=data.type,
+            product_id=data.product_id,
+            quantity=data.quantity,
+            from_warehouse_id=data.from_warehouse_id,
+            to_warehouse_id=data.to_warehouse_id,
+            performed_by=user.id,
+        )
+        db.add(movement)
+        await db.commit()
+        await invalidate_valuation_cache()
+
+        if product is not None and data.from_warehouse_id is not None:
+            new_balance = await get_balance(db, product.id, data.from_warehouse_id)
+            if new_balance < product.min_stock_level:
+                background_tasks.add_task(
+                    notify_low_stock,
+                    product.sku,
+                    product.name,
+                    data.from_warehouse_id,
+                    new_balance,
+                    product.min_stock_level,
+                )
+
+        await db.refresh(movement)
+        result_body = MovementOut.model_validate(movement).model_dump(mode="json")
+        if idempotency_key:
+            await idempotency_set_result(user.id, "/movements", idempotency_key, 201, result_body)
+        return movement
+
+    except HTTPException:
+        if idempotency_key:
+            await idempotency_delete(user.id, "/movements", idempotency_key)
+        raise
 
 
 @router.post(
@@ -141,134 +169,154 @@ async def create_batch_movement(
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
+    idempotency_key: str | None = Header(default=None, alias="Idempotency-Key"),
 ):
-    if data.from_warehouse_id is not None:
-        await check_active_warehouse(db, data.from_warehouse_id)
-    if data.to_warehouse_id is not None:
-        await check_active_warehouse(db, data.to_warehouse_id)
+    if idempotency_key:
+        cached = await idempotency_get(user.id, "/movements/batch", idempotency_key)
+        if cached is not None:
+            if cached["status_code"] == 0:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Request is already being processed")
+            return JSONResponse(status_code=cached["status_code"], content=cached["body"])
+        acquired = await idempotency_set_processing(user.id, "/movements/batch", idempotency_key)
+        if not acquired:
+            raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Request is already being processed")
 
-    quantity_by_sku: dict[str, int] = defaultdict(int)
-    for item in data.items:
-        quantity_by_sku[item.sku] += item.quantity
+    try:
+        if data.from_warehouse_id is not None:
+            await check_active_warehouse(db, data.from_warehouse_id)
+        if data.to_warehouse_id is not None:
+            await check_active_warehouse(db, data.to_warehouse_id)
 
-    skus = list(quantity_by_sku.keys())
+        quantity_by_sku: dict[str, int] = defaultdict(int)
+        for item in data.items:
+            quantity_by_sku[item.sku] += item.quantity
 
-    if data.type in (MovementType.OUT, MovementType.TRANSFER):
-        # Sort by id so all concurrent transactions acquire locks in the same order,
-        # preventing deadlocks on parallel batch requests
-        result = await db.execute(
-            select(Product)
-            .where(Product.sku.in_(skus), Product.is_deleted == False)
-            .order_by(Product.id)
-            .with_for_update()
-        )
-    else:
-        result = await db.execute(
-            select(Product).where(Product.sku.in_(skus), Product.is_deleted == False)
-        )
+        skus = list(quantity_by_sku.keys())
 
-    products_by_sku = {p.sku: p for p in result.scalars().all()}
-
-    unknown = [sku for sku in skus if sku not in products_by_sku]
-    if unknown:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail={"message": "Products not found", "skus": unknown},
-        )
-
-    if data.type in (MovementType.OUT, MovementType.TRANSFER):
-        product_ids = [p.id for p in products_by_sku.values()]
-
-        balance_result = await db.execute(
-            select(
-                StockMovement.product_id,
-                func.coalesce(
-                    func.sum(
-                        case((StockMovement.to_warehouse_id == data.from_warehouse_id, StockMovement.quantity), else_=0)
-                    )
-                    - func.sum(
-                        case((StockMovement.from_warehouse_id == data.from_warehouse_id, StockMovement.quantity), else_=0)
-                    ),
-                    0,
-                ).label("balance"),
+        if data.type in (MovementType.OUT, MovementType.TRANSFER):
+            # Sort by id so all concurrent transactions acquire locks in the same order,
+            # preventing deadlocks on parallel batch requests
+            result = await db.execute(
+                select(Product)
+                .where(Product.sku.in_(skus), Product.is_deleted == False)
+                .order_by(Product.id)
+                .with_for_update()
             )
-            .where(
-                StockMovement.product_id.in_(product_ids),
-                or_(
-                    StockMovement.to_warehouse_id == data.from_warehouse_id,
-                    StockMovement.from_warehouse_id == data.from_warehouse_id,
-                ),
+        else:
+            result = await db.execute(
+                select(Product).where(Product.sku.in_(skus), Product.is_deleted == False)
             )
-            .group_by(StockMovement.product_id)
-        )
-        balances = {row.product_id: row.balance for row in balance_result.all()}
 
-        insufficient = []
-        for sku, total_qty in quantity_by_sku.items():
-            product = products_by_sku[sku]
-            available = balances.get(product.id, 0)
-            if available < total_qty:
-                insufficient.append({"sku": sku, "requested": total_qty, "available": available})
+        products_by_sku = {p.sku: p for p in result.scalars().all()}
 
-        if insufficient:
+        unknown = [sku for sku in skus if sku not in products_by_sku]
+        if unknown:
             raise HTTPException(
-                status_code=status.HTTP_409_CONFLICT,
-                detail={"message": "Insufficient stock", "items": insufficient},
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail={"message": "Products not found", "skus": unknown},
             )
 
-    movements = [
-        StockMovement(
-            type=data.type,
-            product_id=products_by_sku[item.sku].id,
-            quantity=item.quantity,
-            from_warehouse_id=data.from_warehouse_id,
-            to_warehouse_id=data.to_warehouse_id,
-            performed_by=user.id,
-        )
-        for item in data.items
-    ]
-    db.add_all(movements)
-    await db.commit()
-    await invalidate_valuation_cache()
+        if data.type in (MovementType.OUT, MovementType.TRANSFER):
+            product_ids = [p.id for p in products_by_sku.values()]
 
-    if data.type in (MovementType.OUT, MovementType.TRANSFER) and data.from_warehouse_id is not None:
-        product_ids = [p.id for p in products_by_sku.values()]
-        new_balance_result = await db.execute(
-            select(
-                StockMovement.product_id,
-                func.coalesce(
-                    func.sum(
-                        case((StockMovement.to_warehouse_id == data.from_warehouse_id, StockMovement.quantity), else_=0)
-                    )
-                    - func.sum(
-                        case((StockMovement.from_warehouse_id == data.from_warehouse_id, StockMovement.quantity), else_=0)
+            balance_result = await db.execute(
+                select(
+                    StockMovement.product_id,
+                    func.coalesce(
+                        func.sum(
+                            case((StockMovement.to_warehouse_id == data.from_warehouse_id, StockMovement.quantity), else_=0)
+                        )
+                        - func.sum(
+                            case((StockMovement.from_warehouse_id == data.from_warehouse_id, StockMovement.quantity), else_=0)
+                        ),
+                        0,
+                    ).label("balance"),
+                )
+                .where(
+                    StockMovement.product_id.in_(product_ids),
+                    or_(
+                        StockMovement.to_warehouse_id == data.from_warehouse_id,
+                        StockMovement.from_warehouse_id == data.from_warehouse_id,
                     ),
-                    0,
-                ).label("balance"),
+                )
+                .group_by(StockMovement.product_id)
             )
-            .where(
-                StockMovement.product_id.in_(product_ids),
-                or_(
-                    StockMovement.to_warehouse_id == data.from_warehouse_id,
-                    StockMovement.from_warehouse_id == data.from_warehouse_id,
-                ),
-            )
-            .group_by(StockMovement.product_id)
-        )
-        new_balances = {row.product_id: row.balance for row in new_balance_result.all()}
+            balances = {row.product_id: row.balance for row in balance_result.all()}
 
-        for product in products_by_sku.values():
-            new_bal = new_balances.get(product.id, 0)
-            if new_bal < product.min_stock_level:
-                background_tasks.add_task(
-                    notify_low_stock,
-                    product.sku,
-                    product.name,
-                    data.from_warehouse_id,
-                    new_bal,
-                    product.min_stock_level,
+            insufficient = []
+            for sku, total_qty in quantity_by_sku.items():
+                product = products_by_sku[sku]
+                available = balances.get(product.id, 0)
+                if available < total_qty:
+                    insufficient.append({"sku": sku, "requested": total_qty, "available": available})
+
+            if insufficient:
+                raise HTTPException(
+                    status_code=status.HTTP_409_CONFLICT,
+                    detail={"message": "Insufficient stock", "items": insufficient},
                 )
 
-    for m in movements:
-        await db.refresh(m)
-    return movements
+        movements = [
+            StockMovement(
+                type=data.type,
+                product_id=products_by_sku[item.sku].id,
+                quantity=item.quantity,
+                from_warehouse_id=data.from_warehouse_id,
+                to_warehouse_id=data.to_warehouse_id,
+                performed_by=user.id,
+            )
+            for item in data.items
+        ]
+        db.add_all(movements)
+        await db.commit()
+        await invalidate_valuation_cache()
+
+        if data.type in (MovementType.OUT, MovementType.TRANSFER) and data.from_warehouse_id is not None:
+            product_ids = [p.id for p in products_by_sku.values()]
+            new_balance_result = await db.execute(
+                select(
+                    StockMovement.product_id,
+                    func.coalesce(
+                        func.sum(
+                            case((StockMovement.to_warehouse_id == data.from_warehouse_id, StockMovement.quantity), else_=0)
+                        )
+                        - func.sum(
+                            case((StockMovement.from_warehouse_id == data.from_warehouse_id, StockMovement.quantity), else_=0)
+                        ),
+                        0,
+                    ).label("balance"),
+                )
+                .where(
+                    StockMovement.product_id.in_(product_ids),
+                    or_(
+                        StockMovement.to_warehouse_id == data.from_warehouse_id,
+                        StockMovement.from_warehouse_id == data.from_warehouse_id,
+                    ),
+                )
+                .group_by(StockMovement.product_id)
+            )
+            new_balances = {row.product_id: row.balance for row in new_balance_result.all()}
+
+            for product in products_by_sku.values():
+                new_bal = new_balances.get(product.id, 0)
+                if new_bal < product.min_stock_level:
+                    background_tasks.add_task(
+                        notify_low_stock,
+                        product.sku,
+                        product.name,
+                        data.from_warehouse_id,
+                        new_bal,
+                        product.min_stock_level,
+                    )
+
+        for m in movements:
+            await db.refresh(m)
+        result_body = [MovementOut.model_validate(m).model_dump(mode="json") for m in movements]
+        if idempotency_key:
+            await idempotency_set_result(user.id, "/movements/batch", idempotency_key, 201, result_body)
+        return movements
+
+    except HTTPException:
+        if idempotency_key:
+            await idempotency_delete(user.id, "/movements/batch", idempotency_key)
+        raise
