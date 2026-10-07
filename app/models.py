@@ -2,7 +2,7 @@ import enum
 from datetime import datetime
 from decimal import Decimal
 
-from sqlalchemy import String, Boolean, Integer, Numeric, ForeignKey, DateTime, Enum, func
+from sqlalchemy import CheckConstraint, Index, String, Boolean, Integer, Numeric, ForeignKey, DateTime, Enum, func
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.database import Base
@@ -51,6 +51,12 @@ class Product(Base):
 
 class StockMovement(Base):
     __tablename__ = "stock_movements"
+    __table_args__ = (
+        CheckConstraint("quantity > 0", name="ck_stock_movements_quantity_positive"),
+        Index("ix_stock_movements_product_id", "product_id"),
+        Index("ix_stock_movements_from_warehouse_id", "from_warehouse_id"),
+        Index("ix_stock_movements_to_warehouse_id", "to_warehouse_id"),
+    )
 
     id: Mapped[int] = mapped_column(primary_key=True)
     type: Mapped[MovementType] = mapped_column(Enum(MovementType), nullable=False)

@@ -110,6 +110,9 @@ All items are validated in a single transaction. Balances for all products are f
 ### Cache
 `GET /warehouses/valuation` result is cached in Redis under key `financial_valuation` with TTL 300s. The cache is invalidated (deleted) after every `commit` in movements, and after any product price or warehouse name change. If Redis is unavailable, the error is logged and the request proceeds normally.
 
+### Indexes and constraints
+`stock_movements` has B-tree indexes on `product_id`, `from_warehouse_id`, and `to_warehouse_id` — the columns used in every balance aggregation query. A `CHECK (quantity > 0)` constraint enforces the business rule at the database level.
+
 ### Low-stock notification
 After each OUT or TRANSFER `commit`, the new balance is compared to `min_stock_level`. If below, `BackgroundTasks.add_task` schedules `notify_low_stock` — the HTTP response is returned immediately and the notification runs after.
 
