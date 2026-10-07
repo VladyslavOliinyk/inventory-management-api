@@ -78,6 +78,10 @@ class ProductOut(BaseModel):
     model_config = {"from_attributes": True}
 
 
+class ProductWithBalance(ProductOut):
+    total_balance: int
+
+
 # --- Movements ---
 
 class MovementCreate(BaseModel):
@@ -104,7 +108,18 @@ class MovementCreate(BaseModel):
             not self.from_warehouse_id or not self.to_warehouse_id
         ):
             raise ValueError("TRANSFER requires both from_warehouse_id and to_warehouse_id")
+        if (
+            self.type == MovementType.TRANSFER
+            and self.from_warehouse_id == self.to_warehouse_id
+        ):
+            raise ValueError("TRANSFER requires different from and to warehouses")
         return self
+
+
+class WarehouseValuation(BaseModel):
+    warehouse_id: int
+    name: str
+    total_value: Decimal
 
 
 class MovementOut(BaseModel):
@@ -121,7 +136,7 @@ class MovementOut(BaseModel):
 
 
 class BatchItem(BaseModel):
-    product_id: int
+    sku: str
     quantity: int
 
     @field_validator("quantity")
@@ -140,10 +155,17 @@ class BatchMovementCreate(BaseModel):
 
     @model_validator(mode="after")
     def validate_warehouses(self) -> "BatchMovementCreate":
+        if self.type == MovementType.IN and not self.to_warehouse_id:
+            raise ValueError("IN batch requires to_warehouse_id")
         if self.type == MovementType.OUT and not self.from_warehouse_id:
             raise ValueError("OUT batch requires from_warehouse_id")
         if self.type == MovementType.TRANSFER and (
             not self.from_warehouse_id or not self.to_warehouse_id
         ):
             raise ValueError("TRANSFER batch requires both warehouses")
+        if (
+            self.type == MovementType.TRANSFER
+            and self.from_warehouse_id == self.to_warehouse_id
+        ):
+            raise ValueError("TRANSFER requires different from and to warehouses")
         return self
