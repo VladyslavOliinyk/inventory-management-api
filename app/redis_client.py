@@ -11,7 +11,8 @@ redis_client = redis.from_url(settings.redis_url, decode_responses=True)
 
 VALUATION_CACHE_KEY = "financial_valuation"
 VALUATION_CACHE_TTL = 300  # seconds
-IDEMPOTENCY_TTL = 86400  # 24 hours
+IDEMPOTENCY_TTL = 86400  # 24 hours — for stored results
+IDEMPOTENCY_PROCESSING_TTL = 60  # seconds — for "in-flight" marker
 
 
 async def invalidate_valuation_cache() -> None:
@@ -55,7 +56,7 @@ async def idempotency_set_processing(user_id: int, path: str, key: str) -> bool:
             redis_key,
             json.dumps({"status_code": 0}),
             nx=True,
-            ex=IDEMPOTENCY_TTL,
+            ex=IDEMPOTENCY_PROCESSING_TTL,
         )
         return bool(acquired)
     except Exception as exc:

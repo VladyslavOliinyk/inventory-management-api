@@ -10,6 +10,7 @@ from app.auth import hash_password
 from app.database import AsyncSessionLocal, engine
 from app.main import app
 from app.models import Base, User, UserRole
+from app.redis_client import redis_client
 
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
@@ -28,10 +29,12 @@ def ensure_tables():
 @pytest_asyncio.fixture(autouse=True)
 async def clean_db():
     await engine.dispose()
+    redis_client.connection_pool.reset()  # drop stale connections from previous event loop
     async with engine.begin() as conn:
         await conn.execute(text(
             "TRUNCATE stock_movements, products, warehouses, users RESTART IDENTITY CASCADE"
         ))
+    await redis_client.flushdb()
 
 
 @pytest_asyncio.fixture

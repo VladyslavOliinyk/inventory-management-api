@@ -85,6 +85,7 @@ async def create_movement(
         if not acquired:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Request is already being processed")
 
+    committed = False
     try:
         if data.to_warehouse_id is not None:
             await check_active_warehouse(db, data.to_warehouse_id)
@@ -128,6 +129,7 @@ async def create_movement(
         )
         db.add(movement)
         await db.commit()
+        committed = True
         await invalidate_valuation_cache()
 
         if product is not None and data.from_warehouse_id is not None:
@@ -148,8 +150,8 @@ async def create_movement(
             await idempotency_set_result(user.id, "/movements", idempotency_key, 201, result_body)
         return movement
 
-    except HTTPException:
-        if idempotency_key:
+    except Exception:
+        if idempotency_key and not committed:
             await idempotency_delete(user.id, "/movements", idempotency_key)
         raise
 
@@ -181,6 +183,7 @@ async def create_batch_movement(
         if not acquired:
             raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="Request is already being processed")
 
+    committed = False
     try:
         if data.from_warehouse_id is not None:
             await check_active_warehouse(db, data.from_warehouse_id)
@@ -269,6 +272,7 @@ async def create_batch_movement(
         ]
         db.add_all(movements)
         await db.commit()
+        committed = True
         await invalidate_valuation_cache()
 
         if data.type in (MovementType.OUT, MovementType.TRANSFER) and data.from_warehouse_id is not None:
@@ -316,7 +320,7 @@ async def create_batch_movement(
             await idempotency_set_result(user.id, "/movements/batch", idempotency_key, 201, result_body)
         return movements
 
-    except HTTPException:
-        if idempotency_key:
+    except Exception:
+        if idempotency_key and not committed:
             await idempotency_delete(user.id, "/movements/batch", idempotency_key)
         raise
