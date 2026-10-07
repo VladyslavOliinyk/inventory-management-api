@@ -144,7 +144,9 @@ After each OUT or TRANSFER `commit`, the new balance is compared to `min_stock_l
 
 ## Running tests
 
-Tests run against a real PostgreSQL instance from Docker Compose:
+Tests use a separate `inventory_test` database and Redis db=1, so the main
+`inventory_db` and Redis db=0 are never touched. The test database is created
+automatically on first run.
 
 ```bash
 docker compose run --rm app pytest tests/ -v
