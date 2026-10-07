@@ -1,7 +1,7 @@
 import json
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import case, func, literal, or_, select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.dialects.postgresql import NUMERIC
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -75,8 +75,8 @@ async def get_financial_valuation(
                         else_=0,
                     )
                 ),
-                literal(0).cast(NUMERIC(12, 2)),
-            ).label("total_value"),
+                0,
+            ).cast(NUMERIC(12, 2)).label("total_value"),
         )
         .outerjoin(
             StockMovement,
