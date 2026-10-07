@@ -1,12 +1,13 @@
 from collections import defaultdict
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, status
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
 from app.dependencies import get_current_user
 from app.models import MovementType, Product, StockMovement, User, Warehouse
+from app.notifications import notify_low_stock
 from app.redis_client import invalidate_valuation_cache
 from app.schemas import BatchMovementCreate, MovementCreate, MovementOut
 
@@ -62,6 +63,7 @@ async def check_active_warehouse(db: AsyncSession, warehouse_id: int) -> None:
 )
 async def create_movement(
     data: MovementCreate,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -77,6 +79,7 @@ async def create_movement(
         if not result.scalar_one_or_none():
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Product not found")
 
+    product = None
     if data.type in (MovementType.OUT, MovementType.TRANSFER):
         # SELECT FOR UPDATE блокирует строку товара до конца транзакции,
         # не давая другим запросам одновременно списать тот же остаток
@@ -107,6 +110,20 @@ async def create_movement(
     db.add(movement)
     await db.commit()
     await invalidate_valuation_cache()
+
+    # Проверяем остаток после commit — если упал ниже порога, шлём уведомление фоном
+    if product is not None and data.from_warehouse_id is not None:
+        new_balance = await get_balance(db, product.id, data.from_warehouse_id)
+        if new_balance < product.min_stock_level:
+            background_tasks.add_task(
+                notify_low_stock,
+                product.sku,
+                product.name,
+                data.from_warehouse_id,
+                new_balance,
+                product.min_stock_level,
+            )
+
     await db.refresh(movement)
     return movement
 
@@ -123,6 +140,7 @@ async def create_movement(
 )
 async def create_batch_movement(
     data: BatchMovementCreate,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
@@ -219,6 +237,46 @@ async def create_batch_movement(
     db.add_all(movements)
     await db.commit()
     await invalidate_valuation_cache()
+
+    # Проверяем остатки после commit для всех списанных товаров
+    if data.type in (MovementType.OUT, MovementType.TRANSFER) and data.from_warehouse_id is not None:
+        product_ids = [p.id for p in products_by_sku.values()]
+        new_balance_result = await db.execute(
+            select(
+                StockMovement.product_id,
+                func.coalesce(
+                    func.sum(
+                        case((StockMovement.to_warehouse_id == data.from_warehouse_id, StockMovement.quantity), else_=0)
+                    )
+                    - func.sum(
+                        case((StockMovement.from_warehouse_id == data.from_warehouse_id, StockMovement.quantity), else_=0)
+                    ),
+                    0,
+                ).label("balance"),
+            )
+            .where(
+                StockMovement.product_id.in_(product_ids),
+                or_(
+                    StockMovement.to_warehouse_id == data.from_warehouse_id,
+                    StockMovement.from_warehouse_id == data.from_warehouse_id,
+                ),
+            )
+            .group_by(StockMovement.product_id)
+        )
+        new_balances = {row.product_id: row.balance for row in new_balance_result.all()}
+
+        for product in products_by_sku.values():
+            new_bal = new_balances.get(product.id, 0)
+            if new_bal < product.min_stock_level:
+                background_tasks.add_task(
+                    notify_low_stock,
+                    product.sku,
+                    product.name,
+                    data.from_warehouse_id,
+                    new_bal,
+                    product.min_stock_level,
+                )
+
     for m in movements:
         await db.refresh(m)
     return movements
