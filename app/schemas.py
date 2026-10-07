@@ -1,8 +1,9 @@
+from datetime import datetime
 from decimal import Decimal
 
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator, model_validator
 
-from app.models import UserRole
+from app.models import MovementType, UserRole
 
 
 # --- Auth ---
@@ -75,3 +76,74 @@ class ProductOut(BaseModel):
     is_deleted: bool
 
     model_config = {"from_attributes": True}
+
+
+# --- Movements ---
+
+class MovementCreate(BaseModel):
+    type: MovementType
+    product_id: int
+    quantity: int
+    from_warehouse_id: int | None = None
+    to_warehouse_id: int | None = None
+
+    @field_validator("quantity")
+    @classmethod
+    def quantity_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("quantity must be greater than 0")
+        return v
+
+    @model_validator(mode="after")
+    def validate_warehouses(self) -> "MovementCreate":
+        if self.type == MovementType.IN and not self.to_warehouse_id:
+            raise ValueError("IN requires to_warehouse_id")
+        if self.type == MovementType.OUT and not self.from_warehouse_id:
+            raise ValueError("OUT requires from_warehouse_id")
+        if self.type == MovementType.TRANSFER and (
+            not self.from_warehouse_id or not self.to_warehouse_id
+        ):
+            raise ValueError("TRANSFER requires both from_warehouse_id and to_warehouse_id")
+        return self
+
+
+class MovementOut(BaseModel):
+    id: int
+    type: MovementType
+    product_id: int
+    quantity: int
+    from_warehouse_id: int | None
+    to_warehouse_id: int | None
+    performed_by: int
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class BatchItem(BaseModel):
+    product_id: int
+    quantity: int
+
+    @field_validator("quantity")
+    @classmethod
+    def quantity_positive(cls, v: int) -> int:
+        if v <= 0:
+            raise ValueError("quantity must be greater than 0")
+        return v
+
+
+class BatchMovementCreate(BaseModel):
+    type: MovementType
+    from_warehouse_id: int | None = None
+    to_warehouse_id: int | None = None
+    items: list[BatchItem]
+
+    @model_validator(mode="after")
+    def validate_warehouses(self) -> "BatchMovementCreate":
+        if self.type == MovementType.OUT and not self.from_warehouse_id:
+            raise ValueError("OUT batch requires from_warehouse_id")
+        if self.type == MovementType.TRANSFER and (
+            not self.from_warehouse_id or not self.to_warehouse_id
+        ):
+            raise ValueError("TRANSFER batch requires both warehouses")
+        return self
