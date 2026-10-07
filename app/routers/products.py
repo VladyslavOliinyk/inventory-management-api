@@ -3,6 +3,7 @@ from typing import Literal
 
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import case, func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -90,7 +91,12 @@ async def list_products(
     ]
 
 
-@router.post("", response_model=ProductOut, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=ProductOut,
+    status_code=status.HTTP_201_CREATED,
+    responses={409: {"description": "SKU already exists"}},
+)
 async def create_product(
     data: ProductCreate,
     db: AsyncSession = Depends(get_db),
@@ -98,7 +104,14 @@ async def create_product(
 ):
     product = Product(**data.model_dump())
     db.add(product)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Product with SKU '{data.sku}' already exists",
+        )
     await db.refresh(product)
     return product
 
@@ -118,7 +131,11 @@ async def get_product(
     return product
 
 
-@router.patch("/{product_id}", response_model=ProductOut)
+@router.patch(
+    "/{product_id}",
+    response_model=ProductOut,
+    responses={409: {"description": "SKU already exists"}},
+)
 async def update_product(
     product_id: int,
     data: ProductUpdate,
@@ -135,7 +152,14 @@ async def update_product(
     for key, value in data.model_dump(exclude_unset=True).items():
         setattr(product, key, value)
 
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Product with this SKU already exists",
+        )
     # base_price могла измениться — финансовая оценка складов стала неактуальной
     await invalidate_valuation_cache()
     await db.refresh(product)

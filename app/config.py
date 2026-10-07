@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     postgres_port: int = 5432
     redis_url: str = "redis://localhost:6379"
     secret_key: str
+    db_echo: bool = False
 
     @property
     def database_url(self) -> str:

@@ -1,7 +1,9 @@
 import json
 
-from fastapi import APIRouter, Depends, HTTPException, status
-from sqlalchemy import and_, case, func, or_, select
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from sqlalchemy import case, func, literal, or_, select
+from sqlalchemy.dialects.postgresql import NUMERIC
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.database import get_db
@@ -15,14 +17,23 @@ router = APIRouter(prefix="/warehouses", tags=["warehouses"])
 
 @router.get("", response_model=list[WarehouseOut])
 async def list_warehouses(
+    include_inactive: bool = Query(default=False),
     db: AsyncSession = Depends(get_db),
     _: User = Depends(get_current_user),
 ):
-    result = await db.execute(select(Warehouse))
+    stmt = select(Warehouse)
+    if not include_inactive:
+        stmt = stmt.where(Warehouse.is_active == True)
+    result = await db.execute(stmt)
     return result.scalars().all()
 
 
-@router.post("", response_model=WarehouseOut, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=WarehouseOut,
+    status_code=status.HTTP_201_CREATED,
+    responses={409: {"description": "location_code already exists"}},
+)
 async def create_warehouse(
     data: WarehouseCreate,
     db: AsyncSession = Depends(get_db),
@@ -30,7 +41,14 @@ async def create_warehouse(
 ):
     warehouse = Warehouse(**data.model_dump())
     db.add(warehouse)
-    await db.commit()
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail=f"Warehouse with location_code '{data.location_code}' already exists",
+        )
     await invalidate_valuation_cache()
     await db.refresh(warehouse)
     return warehouse
@@ -48,7 +66,7 @@ async def get_financial_valuation(
 
     # Один запрос: для каждого склада считаем стоимость остатков.
     # CASE: движение "в склад" → +qty*price, "со склада" → -qty*price.
-    # COALESCE(..., 0) — для складов без движений.
+    # literal(0).cast(NUMERIC) гарантирует, что COALESCE вернёт "0.00", а не "0".
     stmt = (
         select(
             Warehouse.id.label("warehouse_id"),
@@ -61,7 +79,7 @@ async def get_financial_valuation(
                         else_=0,
                     )
                 ),
-                0,
+                literal(0).cast(NUMERIC(12, 2)),
             ).label("total_value"),
         )
         .outerjoin(
@@ -108,7 +126,11 @@ async def get_warehouse(
     return warehouse
 
 
-@router.patch("/{warehouse_id}", response_model=WarehouseOut)
+@router.patch(
+    "/{warehouse_id}",
+    response_model=WarehouseOut,
+    responses={409: {"description": "location_code already exists"}},
+)
 async def update_warehouse(
     warehouse_id: int,
     data: WarehouseUpdate,
@@ -123,8 +145,14 @@ async def update_warehouse(
     for key, value in data.model_dump(exclude_unset=True).items():
         setattr(warehouse, key, value)
 
-    await db.commit()
-    # name могло измениться — в кэше оценки хранится имя склада
+    try:
+        await db.commit()
+    except IntegrityError:
+        await db.rollback()
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Warehouse with this location_code already exists",
+        )
     await invalidate_valuation_cache()
     await db.refresh(warehouse)
     return warehouse

@@ -51,7 +51,15 @@ async def check_active_warehouse(db: AsyncSession, warehouse_id: int) -> None:
         )
 
 
-@router.post("", response_model=MovementOut, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "",
+    response_model=MovementOut,
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        400: {"description": "Warehouse is not active"},
+        409: {"description": "Insufficient stock"},
+    },
+)
 async def create_movement(
     data: MovementCreate,
     db: AsyncSession = Depends(get_db),
@@ -103,7 +111,16 @@ async def create_movement(
     return movement
 
 
-@router.post("/batch", response_model=list[MovementOut], status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/batch",
+    response_model=list[MovementOut],
+    status_code=status.HTTP_201_CREATED,
+    responses={
+        400: {"description": "Warehouse is not active"},
+        404: {"description": "Products not found"},
+        409: {"description": "Insufficient stock"},
+    },
+)
 async def create_batch_movement(
     data: BatchMovementCreate,
     db: AsyncSession = Depends(get_db),
